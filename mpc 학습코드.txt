@@ -1,0 +1,128 @@
+# ============================================================
+# MP-SPDZ 기반 MPC-SGD Logistic Regression 학습 코드
+# ============================================================
+# 목적:
+#   병원 A, B, C의 학습 데이터를 중앙 서버에 직접 통합하지 않고
+#   MP-SPDZ의 비밀분산 기반 연산을 통해 SGD 방식의
+#   로지스틱 회귀 모델 파라미터를 학습한다.
+#
+# 입력:
+#   Player-Data/Input-P0-0  -> 병원 A train 데이터
+#   Player-Data/Input-P1-0  -> 병원 B train 데이터
+#   Player-Data/Input-P2-0  -> 병원 C train 데이터
+#
+# 입력 형식:
+#   각 샘플은 feature 19개 + label 1개로 구성된다.
+#   feature 값은 Colab에서 StandardScaler 적용 후
+#   scale_factor=1000을 곱해 정수형으로 변환하였다.
+#
+# 출력:
+#   학습된 bias와 19개의 weight를 reveal하여 출력한다.
+#   출력된 파라미터는 Colab/Python 환경에서
+#   공통 test set에 적용하여 성능평가에 사용한다.
+# ============================================================
+
+program.use_trunc_pr = True
+program.use_split(3)
+
+# =========================
+# 1. 실험 설정
+# =========================
+
+# 각 병원 train 데이터의 행 수
+# Player-Data/Input-P*-0 줄 수 = 27137 * 20 = 542740
+n_rows = 27137
+
+# 입력 변수 수
+n_features = 19
+
+# Colab에서 MPC 입력 생성 시 사용한 scale factor
+scale_factor = 1000
+
+# MPC-SGD 학습 설정
+epochs = 1
+
+# 전체 train 데이터 학습 시 sfix overflow 방지를 위해 낮은 learning rate 적용
+lr = sfix(0.0001)
+
+
+# =========================
+# 2. 모델 파라미터 초기화
+# =========================
+
+w = Array(n_features, sfix)
+b = MemValue(sfix(0))
+
+for j in range(n_features):
+    w[j] = sfix(0)
+
+
+# =========================
+# 3. Sigmoid 근사 함수
+# =========================
+# 일반 sigmoid는 exp 연산을 포함하므로 MPC 환경에서 계산 비용이 큼.
+# 전체 train 데이터 학습에서는 cubic 근사식 사용 시 sfix 범위 초과로 NaN이 발생할 수 있어,
+# 본 최종 실험에서는 선형 근사 sigmoid를 사용하였다.
+#
+# sigmoid(z) ≈ 0.5 + 0.125z
+
+def sigmoid_approx(z):
+    return sfix(0.5) + sfix(0.125) * z
+
+
+# =========================
+# 4. 단일 party의 샘플 1개를 읽고 SGD 업데이트
+# =========================
+
+def train_one_sample_from_party(party_id):
+    x = Array(n_features, sfix)
+
+    # feature 19개 읽기
+    for j in range(n_features):
+        x[j] = sfix.get_input_from(party_id) / scale_factor
+
+    # label 1개 읽기
+    y = sfix.get_input_from(party_id)
+
+    # z = b + w*x
+    z = b.read()
+
+    for j in range(n_features):
+        z += w[j] * x[j]
+
+    # 예측값 계산
+    pred = sigmoid_approx(z)
+
+    # 오차 계산
+    error = pred - y
+
+    # weight 업데이트
+    for j in range(n_features):
+        w[j] = w[j] - lr * error * x[j]
+
+    # bias 업데이트
+    b.write(b.read() - lr * error)
+
+
+# =========================
+# 5. MPC-SGD 학습 수행
+# =========================
+# 각 row마다 병원 A, B, C의 샘플을 순차적으로 학습한다.
+# 총 업데이트 횟수 = n_rows * 3
+
+@for_range(n_rows)
+def _(i):
+    train_one_sample_from_party(0)
+    train_one_sample_from_party(1)
+    train_one_sample_from_party(2)
+
+
+# =========================
+# 6. 학습 결과 출력
+# =========================
+
+print_ln('Training finished')
+print_ln('Bias: %s', b.read().reveal())
+
+for j in range(n_features):
+    print_ln('w%s: %s', j, w[j].reveal())
